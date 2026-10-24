@@ -1,0 +1,142 @@
+name: Build Windows
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: short
+  HUSKY: 0
+
+concurrency:
+  group: '${{ github.workflow }} - ${{ github.head_ref || github.ref }}'
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      # Pinned to match rust-toolchain.toml, otherwise rustup re-downloads 1.99.0 on first cargo call.
+      - name: Install Rust Stable
+        uses: dtolnay/rust-toolchain@1.99.0
+
+      # Shares one cache entry with dev.yml / autobuild.yml via the same prefix-key and key.
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          prefix-key: 'v1-rust'
+          key: 'rust-shared-stable-windows-latest-x86_64-pc-windows-msvc'
+          workspaces: |
+            . -> target
+          cache-all-crates: true
+          cache-workspace-crates: true
+
+      # No `version` input: pnpm is read from the packageManager field in package.json.
+      - uses: pnpm/action-setup@v6
+        name: Install pnpm
+        with:
+          run_install: false
+
+      - name: Install Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24.22.0'
+          cache: 'pnpm'
+
+      - name: Pnpm Cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.pnpm-store
+          key: 'pnpm-shared-stable-windows-latest-x86_64-pc-windows-msvc'
+          restore-keys: |
+            pnpm-shared-stable-windows-latest-x86_64-pc-windows-msvc
+          lookup-only: true
+
+      # prebuild.mjs throws in CI unless an explicit target triple is given, because it
+      # resolves which Mihomo core to download from PLATFORM_MAP/ARCH_MAP.
+      # enablePrePostScripts is false in pnpm-workspace.yaml, so this never runs implicitly.
+      - name: Pnpm install and prebuild
+        run: |
+          pnpm i
+          pnpm run prebuild x86_64-pc-windows-msvc
+
+      - name: Add Rust Target
+        run: |
+          rustup target add x86_64-pc-windows-msvc --toolchain 1.99.0 || rustup target add x86_64-pc-windows-msvc
+          rustup target list --installed
+
+      # Equivalent to what tauri-action ran in dev.yml with tauriScript: pnpm.
+      # `pnpm build` is the package.json script, which sets NODE_OPTIONS via cross-env.
+      #
+      # --no-sign is what makes this workflow runnable on a fork. tauri-cli's sign_updaters demands
+      # TAURI_SIGNING_PRIVATE_KEY for an nsis bundle as soon as plugins.updater carries a pubkey, and
+      # that pubkey is upstream's - this repo has no matching private key, so bundling used to end
+      # with "A public key has been found, but no private key" after a successful 40 minute compile.
+      # autobuild.yml and release.yml do pass the key, and the unsigned installer and the portable
+      # ZIP are both unaffected by skipping the updater signature.
+      - name: Tauri build
+        env:
+          NODE_OPTIONS: '--max_old_space_size=4096'
+        run: pnpm build --target x86_64-pc-windows-msvc -b nsis --no-sign
+
+      # Path is relative to the workspace root: the root Cargo.toml declares a workspace
+      # whose members include src-tauri, so the target dir is ./target, not src-tauri/target.
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+          if-no-files-found: error
+
+      # The portable ZIP is exactly what installer.nsi unpacks into $INSTDIR, minus the steps only
+      # an installer can do (VC++ redist, WebView2 bootstrapper, service registration).
+      # The cores must land beside the exe under their plain names: the app resolves them as
+      # <exe dir>\<clash_core>.exe (shell sidecar plus service_core_path), never with a triple.
+      # data\ is deliberately absent - app_home_dir() creates it next to the exe on first run.
+      - name: Stage portable bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = 'portable/clash-verge'
+          if (Test-Path 'portable') { Remove-Item 'portable' -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          $mainExe = 'target/x86_64-pc-windows-msvc/release/clash-verge.exe'
+          if (-not (Test-Path $mainExe)) { throw "main executable not found at $mainExe" }
+          Copy-Item $mainExe -Destination $stage
+
+          foreach ($core in 'verge-mihomo', 'verge-mihomo-alpha') {
+            # prebuild writes these with the target triple; the installer renames them, so we do too.
+            $sidecar = Get-ChildItem -Path "src-tauri/sidecar/$core*.exe" -File -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+            if (-not $sidecar) { throw "core sidecar not found for $core" }
+            Copy-Item $sidecar.FullName -Destination (Join-Path $stage "$core.exe")
+          }
+
+          if (-not (Test-Path 'src-tauri/resources')) { throw 'resources directory not found' }
+          $resources = Join-Path $stage 'resources'
+          New-Item -ItemType Directory -Force -Path $resources | Out-Null
+          Copy-Item 'src-tauri/resources/*' -Destination $resources -Recurse
+
+          Compress-Archive -Path $stage -DestinationPath 'clash-verge-portable.zip'
+          Get-ChildItem -Recurse $stage | Select-Object -ExpandProperty FullName
+
+      # archive: false keeps the produced zip byte-for-byte, so the artifact downloads as
+      # clash-verge-portable.zip instead of a zip wrapped in a zip.
+      - name: Upload portable ZIP
+        uses: actions/upload-artifact@v7
+        with:
+          name: clash-verge-portable
+          archive: false
+          path: clash-verge-portable.zip
+          if-no-files-found: error
